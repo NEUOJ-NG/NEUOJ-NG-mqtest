@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	log "github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
 	"os"
@@ -14,19 +15,11 @@ func failOnError(err error, msg string) {
 	}
 }
 
-func main() {
-	// connect
-	log.Info("connecting to RabbitMQ")
-	conn, err := amqp.Dial("amqp://guest:guest@127.0.0.1:5672/")
-	failOnError(err, "failed to connect to RabbitMQ")
-	defer conn.Close()
-	log.Info("connect to RabbitMQ success")
-
+func setupTestSender(conn *amqp.Connection) (*amqp.Channel, amqp.Queue) {
 	//=========== sender ===========
 	// open a sender channel
 	chSender, err := conn.Channel()
 	failOnError(err, "failed to open a sender channel")
-	defer chSender.Close()
 	log.Info("open sender channel success")
 
 	// declare a sender queue
@@ -41,12 +34,15 @@ func main() {
 	failOnError(err, "failed to declare a sender queue")
 	log.Infof("declare sender queue with name %s success", qSender.Name)
 
+	return chSender, qSender
+}
+
+func startTestConsumer(conn *amqp.Connection) *amqp.Channel {
 	//=========== consumer ===========
 	// open a consumer channel
 	chConsumer, err := conn.Channel()
 	failOnError(err, "failed to open a consumer channel")
-	defer chConsumer.Close()
-	log.Info("open sender consumer success")
+	log.Info("open consumer success")
 
 	// declare a consumer queue
 	qConsumer, err := chConsumer.QueueDeclare(
@@ -70,25 +66,55 @@ func main() {
 		false,
 		nil,
 	)
-	failOnError(err, "Failed to register a consumer")
+	failOnError(err, "failed to register a consumer")
 	log.Info("register consumer success")
 
 	go func() {
-		for msg := range msgs {
-			log.Infof("received a message: %s", msg.Body)
-			time.Sleep(2 * time.Second)
-			_ = msg.Ack(false)
+		for {
+			select {
+			case msg := <-msgs:
+				log.Infof("received a message: %s", msg.Body)
+				_ = msg.Ack(false)
+			default:
+				log.Info("no message in channel")
+			}
+			time.Sleep(1 * time.Second)
 		}
 	}()
 
-	// test publish message
+	return chConsumer
+}
+
+func main() {
+	log.SetLevel(log.DebugLevel)
 	reader := bufio.NewReader(os.Stdin)
+
+	// connect
+	log.Info("connecting to RabbitMQ")
+	conn, err := amqp.Dial("amqp://guest:guest@127.0.0.1:5672/")
+	failOnError(err, "failed to connect to RabbitMQ")
+	defer conn.Close()
+	log.Info("connect to RabbitMQ success")
+
+	// setup sender
+	chSender, qSender := setupTestSender(conn)
+	defer chSender.Close()
+
+	// start consumer on need
+	fmt.Print("start consumer? (y/N)")
+	ans, _ := reader.ReadString('\n')
+	if ans == "Y\n" || ans == "y\n" {
+		chConsumer := startTestConsumer(conn)
+		defer chConsumer.Close()
+	}
+
+	// test publish message
 	for {
 		body, err := reader.ReadString('\n')
 		failOnError(err, "failed to read text from keyboard")
 		msg := amqp.Publishing{
 			DeliveryMode: amqp.Persistent,
-			ContentType:  "text/plain",
+			ContentType:  "application/json",
 			Body:         []byte(body),
 		}
 		err = chSender.Publish(
